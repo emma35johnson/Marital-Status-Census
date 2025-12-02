@@ -1,0 +1,157 @@
+---
+title: "Exploring Census Data"
+author: "Emma Johnson"
+date: "December 2025"
+output: html_document
+---
+
+# S1201: Marital Status
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r reference and packages}
+browseURL("https://data.census.gov/table/ACSST1Y2024.S1201?g=010XX00US$0400000")
+library(tidyverse)
+library(tidycensus)
+```
+
+Here is the typical set-up to fetch census data from the United States Census Bureau:
+
+```{r loading data}
+#census_api_key(API_key, install = TRUE)
+## Use your API key ^ here
+
+marital_status <- get_acs(geography = "state", table = "S1201")
+
+glimpse(marital_status)
+```
+
+Notice how the variables are not informative under their current codes, so we will now fetch more descriptive names using `load_variables()`. To keep the data as concise as possible, we will use these variable names in our main dataframe, `ms` (marital status).
+
+```{r ms df}
+ms <- marital_status %>%
+  left_join(
+    load_variables(2024, "acs1/subject"),
+    join_by(variable == name),
+    keep = FALSE,
+    relationship = "many-to-one"
+            ) %>%
+  select(-concept)
+
+glimpse(ms)
+```
+
+By taking a glimpse of the data, you may notice that the variable names are long and inefficiently named. This is because the data has levels of headers, which can make calling a variable quite difficult. So, the easiest way I found to fix this was to ask ChatGPT to clean it up. Otherwise, feel free to have at it yourself.
+
+```{r breaking up data by state/territory}
+## With a little clean-up help from ChatGPT:
+ms$clean <- ms$label %>%
+  sub("^Estimate!!", "", .) %>%      
+  str_split("!!") %>%
+  sapply(function(parts) {
+    parts <- trimws(tolower(parts))
+
+    # ---- 1. marital status ----
+    status <- parts[1]
+
+    # normalize "now married (except separated)" to "married"
+    status <- gsub("^now married.*", "married", status)
+
+    # ---- 2. last meaningful piece ----
+    last <- parts[length(parts)]
+
+    # ---- 3. detect sex (male/female) anywhere ----
+    sex_word <- NA_character_
+    if (any(grepl("\\bmales?\\b", parts)))   sex_word <- "male"
+    if (any(grepl("\\bfemales?\\b", parts))) sex_word <- "female"
+
+    # ---- 4. remove male/female from final chunk to avoid duplicates ----
+    if (!is.na(sex_word)) {
+      last <- gsub("\\bmales?\\b",   "", last)
+      last <- gsub("\\bfemales?\\b", "", last)
+      label <- paste(status, sex_word, last)
+    } else {
+      label <- paste(status, last)
+    }
+
+    # ---- 5. snake_case cleanup ----
+    label <- gsub("[^a-z0-9]+", "_", label)
+    label <- gsub("_+", "_", label)
+    label <- gsub("^_|_$", "", label)
+
+    label
+  })
+
+ms <- ms %>%
+  select(geo_id = GEOID, name = NAME, variable = clean, estimate, error_margin = moe)
+
+glimpse(ms)
+```
+
+There is lots of redundancy in the data due to grouping by state. That is, columns `geo_id` and `name` (i.e. state/territory name) are repeated for each of their corresponding observations. To improve efficiency, we will want to use this grouping to our advantage, rather than having to make the system re-group every time we want to look at specific states. So, we will nest each territory's data into it's own dataframe using `group_nest` and `group_keys` for lookup.
+
+```{r data per state}
+ms_by_state <- ms %>%
+  group_by(geo_id, name) %>%
+  group_nest(keep = FALSE)
+
+state_keys <- ms %>%
+  group_by(geo_id, name) %>%
+  group_keys()
+
+# e.g. Alabama
+ms_by_state$data[[1]]
+```
+
+It's looking much more digestible already. In addition to the grouping by state, there is also latent groupings of variable type. To optimize efficiency once more, I created an index for the types of variables, so finding them will be easier later.
+
+```{r index of variable types}
+variable_index <- list(
+  total_pop = ms$variable[1:15],
+  race = ms$variable[16:26],
+  labor_force = ms$variable[27:30],
+  ratio_sex = ms$variable[31],
+
+  marital_status_percentage = ms$variable[32],
+  married_pop = ms$variable[33:47],
+  married_race = ms$variable[48:58],
+  married_work_force = ms$variable[59:62],
+
+  widowed_pop = ms$variable[65:79],
+  widowed_race = ms$variable[80:90],
+  widowed_work_force = ms$variable[91:94],
+
+  divorced_pop = ms$variable[97:111],
+  divorced_race = ms$variable[112:122],
+  divorced_work_force = ms$variable[123:126],
+
+  separated_pop = ms$variable[129:143],
+  separated_race = ms$variable[144:154],
+  separated_work_force = ms$variable[155:158],
+
+  never_married_pop = ms$variable[161:175],
+  never_married_race = ms$variable[176:186],
+  never_married_work_force = ms$variable[187:190]
+)
+```
+
+As an example of what we've cleaned up so far, here is how we can fetch a group of variables for a specific state, or even for all states in a comparison:
+
+```{r e.g. variable lookup}
+# Widowed population variables in Alabama (2 ways):
+ms_by_state$data[[1]] %>%
+  filter(variable %in% variable_index$widowed_pop)
+# OR
+ms_by_state %>%
+  filter(name == "Alabama") %>%
+  unnest(cols = everything()) %>%
+  filter(variable %in% variable_index$widowed_pop)
+
+# Ratio of Unmarried Men 15 to 44 years per 100 unmarried women 15 to 44 years
+ms %>%
+  filter(variable %in% variable_index$ratio_sex) %>%
+  select(name, estimate, error_margin)
+```
+
